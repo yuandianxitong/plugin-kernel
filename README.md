@@ -26,4 +26,4 @@ PHP 命名空间为 `core\plugin`。包面向 Webman 宿主，运行时使用宿
 
 源码位于 `src/`。修改后在三个宿主运行插件回归测试，并用 Git 标签发布版本，例如 `v1.0.1`。各宿主用 `composer update yuandianxitong/plugin-kernel` 更新锁文件。
 
-插件包格式、路由和发布要求见 [元点插件规范](https://github.com/yuandianxitong/framework-webman/blob/main/docs/backend/plugin-contract.md)。
+framework-webman 的宿主实现见 [元点框架仓库](https://github.com/yuandianxitong/ydadmin)。
