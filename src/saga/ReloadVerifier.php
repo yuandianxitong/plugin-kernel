@@ -6,6 +6,7 @@ namespace core\plugin\saga;
 
 use core\exception\BusinessException;
 use core\plugin\contracts\PluginHostProfile;
+use core\plugin\ReloadSignal;
 use core\plugin\WorkerFingerprintRegistry;
 use support\Log;
 
@@ -15,11 +16,15 @@ use support\Log;
  * - 被 SIGKILL 的 worker 留下的孤儿 pid 可能被无关进程复用，陈旧指纹会永久拖住判定。所以每轮用
  *   master 的子进程集合再过滤一次；枚举失败时退化为不过滤，每次调用最多记一次 warning。
  * - 空集合（过滤前或过滤后）不算生效，否则 worker 全挂时会误报成功。
+ * - 集合里的 pid 和指纹连续 stop_timeout 秒不变、但仍有旧指纹时，再发一次 SIGUSR1。
+ *   重载进行中集合一直在变，这时补发不会另开一轮，所以必须等它稳住。最多补发两次。
  *
- * 不是 final：测试需要覆写 resolveMasterChildPids() 固定子进程集合。
+ * 不是 final：测试需要覆写 resolveMasterChildPids()、liveWorkers()、resendReload()。
  */
 class ReloadVerifier
 {
+    private const MAX_RELOAD_RESENDS = 2;
+
     public function __construct(private readonly PluginHostProfile $profile)
     {
     }
@@ -33,11 +38,14 @@ class ReloadVerifier
         $intervalMs = max(1, $this->profile->reloadPollIntervalMs());
         $deadline = microtime(true) + $timeout;
         $degradeLogged = false;
+        $stableKey = null;
+        $stableSince = null;
+        $resent = 0;
         /** @var array<int, array{pid:int,fingerprint:string,booted_at:string}> $filtered */
         $filtered = [];
 
         do {
-            $live = WorkerFingerprintRegistry::liveWorkers();
+            $live = $this->liveWorkers();
             $childPids = $this->resolveMasterChildPids();
 
             if ($childPids === null) {
@@ -61,6 +69,26 @@ class ReloadVerifier
                 if ($mismatched === []) {
                     return $expected;
                 }
+
+                $key = $this->fingerprintKey($filtered);
+                $now = microtime(true);
+                if ($key !== $stableKey) {
+                    $stableKey = $key;
+                    $stableSince = $now;
+                } elseif ($resent < self::MAX_RELOAD_RESENDS
+                    && $stableSince !== null
+                    && ($now - $stableSince) >= $this->stopTimeoutSeconds()) {
+                    Log::warning(sprintf(
+                        '[plugin-reload] 指纹已稳定但仍与期望不一致，补发 SIGUSR1（第 %d 次）',
+                        $resent + 1
+                    ));
+                    $this->resendReload();
+                    $resent++;
+                    $stableSince = $now;
+                }
+            } else {
+                $stableKey = null;
+                $stableSince = null;
             }
 
             usleep($intervalMs * 1000);
@@ -88,6 +116,30 @@ class ReloadVerifier
             $expected,
             $detail
         ));
+    }
+
+    /**
+     * 重载进行中再发的 SIGUSR1 不会另开一轮，调用方必须等指纹集合稳住后再调。
+     */
+    protected function resendReload(): void
+    {
+        ReloadSignal::trigger();
+    }
+
+    /**
+     * 与 master 杀掉旧 worker 的 stop_timeout 同一秒数。短于它就补发，会打在还没换完的那一轮上。
+     */
+    protected function stopTimeoutSeconds(): float
+    {
+        return (float) max(1, (int) config('server.stop_timeout', 2));
+    }
+
+    /**
+     * @return array<int, array{pid: int, fingerprint: string, booted_at: string}>
+     */
+    protected function liveWorkers(): array
+    {
+        return WorkerFingerprintRegistry::liveWorkers();
     }
 
     /**
@@ -139,5 +191,19 @@ class ReloadVerifier
         }
 
         return $pids;
+    }
+
+    /**
+     * @param array<int, array{pid:int,fingerprint:string,booted_at:string}> $workers
+     */
+    private function fingerprintKey(array $workers): string
+    {
+        $parts = [];
+        foreach ($workers as $worker) {
+            $parts[] = $worker['pid'] . '=' . $worker['fingerprint'];
+        }
+        sort($parts);
+
+        return implode(',', $parts);
     }
 }
