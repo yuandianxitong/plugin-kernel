@@ -1,0 +1,4 @@
+/vendor/
+/auth.json
+/.env
+.DS_Store
